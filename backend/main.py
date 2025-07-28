@@ -1,19 +1,26 @@
 import os
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Dict, Any,Optional
+from typing import List, Dict, Any, Optional
 import pyodbc
 import struct
 import re
+from datetime import datetime
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, LLM
 import openai
-from vector_schema import get_schema_info_from_vector,initialize_vector_store
+from vector_schema import get_schema_info_from_vector, initialize_vector_store
 from authlib.jose import jwt, JsonWebKey
 import httpx
+from session_manager import session_manager
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -61,11 +68,18 @@ class UserInfo(BaseModel):
     email: str
     role: str
 
-# ✅ JWT token validation (return claims + token)
-async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+class SessionInfo(BaseModel):
+    user: UserInfo
+    session_expiry: str
+    active_sessions: int
+
+# ✅ Enhanced JWT token validation with session management
+async def validate_token_and_session(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     try:
-        print("🔐 Validating JWT token...")
+        logger.info("🔐 Validating JWT token and session...")
+        
+        # Validate JWT token
         async with httpx.AsyncClient() as client:
             jwks_uri = f"https://login.microsoftonline.com/{TENANT_ID}/discovery/v2.0/keys"
             response = await client.get(jwks_uri)
@@ -81,28 +95,84 @@ async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(sec
         )
         claims.validate()
 
-        print("✅ JWT validation passed.")
-        return {"claims": claims, "access_token": token}
+        # Extract user information
+        user_id = claims.get("sub") or claims.get("oid")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
+
+        # Check existing session
+        session_data = session_manager.get_session(user_id)
+        
+        if session_data:
+            # Check if token needs refresh
+            if session_manager.is_token_expired(session_data):
+                logger.info(f"Token expired for user {user_id}, updating session...")
+                # Update session with new token
+                token_expiry = datetime.fromtimestamp(claims.get('exp', 0))
+                session_manager.update_session(user_id, {
+                    'access_token': token,
+                    'expires_at': token_expiry.isoformat()
+                })
+        else:
+            # Create new session
+            logger.info(f"Creating new session for user {user_id}")
+            name = claims.get("name", "Unknown User")
+            email = claims.get("preferred_username", "")
+            
+            user_roles = {
+                "mathu": "Marketing",
+                "baghya": "Finance", 
+                "vivek": "Analyst",
+                "dhivakar": "Admin"
+            }
+            username = name.lower() if name else ""
+            role = user_roles.get(username, "User")
+            
+            user_data = {
+                "name": name,
+                "email": email,
+                "role": role
+            }
+            
+            token_expiry = datetime.fromtimestamp(claims.get('exp', 0))
+            session_manager.create_session(user_id, user_data, token, token_expiry)
+
+        logger.info("✅ JWT validation and session management completed.")
+        return {
+            "claims": claims,
+            "user_id": user_id,
+            "access_token": token
+        }
+        
     except Exception as e:
-        print(f"❌ Token validation error: {e}")
+        logger.error(f"❌ Token validation error: {e}")
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
-# ✅ Get SQL Server connection
-def get_sql_server_connection(access_token: str):
+# ✅ Get SQL Server connection with session-cached token
+def get_sql_server_connection(user_id: str):
     try:
-        print(f"🔑 Access token length: {len(access_token)}")
+        # Get token from session
+        session_data = session_manager.get_session(user_id)
+        if not session_data:
+            raise HTTPException(status_code=401, detail="Session not found")
+        
+        access_token = session_data.get('access_token')
+        if not access_token:
+            raise HTTPException(status_code=401, detail="Access token not found in session")
+
+        logger.info(f"🔑 Using cached token for user {user_id}")
         token_bytes = access_token.encode("utf-16-le")
         token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
 
-        print("📡 Attempting SQL Server connection...")
+        logger.info("📡 Attempting SQL Server connection...")
         conn = pyodbc.connect(
             f"DRIVER={DRIVER};SERVER={SERVER};DATABASE={DATABASE};Encrypt=yes;TrustServerCertificate=no;",
             attrs_before={1256: token_struct}
         )
-        print("✅ SQL Server connection established.")
+        logger.info("✅ SQL Server connection established.")
         return conn
     except Exception as e:
-        print(f"❌ Database connection error: {e}")
+        logger.error(f"❌ Database connection error: {e}")
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
 # SQL Generator Agent
@@ -120,9 +190,9 @@ def extract_sql(text):
     matches = re.findall(r"```sql\s*(.*?)```", text, re.DOTALL)
     return matches[0].strip() if matches else None
 
-def run_query(sql: str, access_token: str):
+def run_query(sql: str, user_id: str):
     try:
-        conn = get_sql_server_connection(access_token)
+        conn = get_sql_server_connection(user_id)
         df = pd.read_sql(sql, conn)
         conn.close()
 
@@ -155,39 +225,67 @@ def run_query(sql: str, access_token: str):
             "table_data": None
         }
 
+# Background task to clean up expired sessions
+async def cleanup_sessions():
+    session_manager.cleanup_expired_sessions()
 
 @app.get("/")
 async def root():
     return {"message": "SQLBot API is running"}
 
 @app.get("/api/user", response_model=UserInfo)
-async def get_user_info(token_data: dict = Depends(validate_token)):
-    claims = token_data["claims"]
-    name = claims.get("name", "Unknown User")
-    email = claims.get("preferred_username", "")
+async def get_user_info(token_data: dict = Depends(validate_token_and_session)):
+    user_id = token_data["user_id"]
+    
+    # Get user data from session
+    user_data = session_manager.get_user_session_data(user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User session not found")
+    
+    logger.info(f"👤 Retrieved user info for: {user_data['name']}, role: {user_data['role']}")
+    return UserInfo(**user_data)
 
-    user_roles = {
-        "mathu": "Marketing",
-        "baghya": "Finance", 
-        "vivek": "Analyst",
-        "dhivakar": "Admin"
-    }
-    username = name.lower() if name else ""
-    role = user_roles.get(username, "User")
+@app.get("/api/session", response_model=SessionInfo)
+async def get_session_info(token_data: dict = Depends(validate_token_and_session)):
+    user_id = token_data["user_id"]
+    
+    session_data = session_manager.get_session(user_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    user_data = session_data.get('user_data', {})
+    active_sessions = session_manager.get_active_sessions_count()
+    
+    return SessionInfo(
+        user=UserInfo(**user_data),
+        session_expiry=session_data.get('expires_at', ''),
+        active_sessions=active_sessions
+    )
 
-    print(f"👤 Authenticated user: {name}, role: {role}")
-    return UserInfo(name=name, email=email, role=role)
+@app.delete("/api/session")
+async def logout_user(token_data: dict = Depends(validate_token_and_session)):
+    user_id = token_data["user_id"]
+    
+    success = session_manager.delete_session(user_id)
+    if success:
+        return {"message": "Session terminated successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to terminate session")
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def process_chat_message(
     chat_message: ChatMessage,
-    token_data: dict = Depends(validate_token)
+    background_tasks: BackgroundTasks,
+    token_data: dict = Depends(validate_token_and_session)
 ):
     try:
-        access_token = token_data["access_token"]
+        user_id = token_data["user_id"]
         claims = token_data["claims"]
-        print(f"📩 User message: {chat_message.message}")
-        print(f"👤 Token subject: {claims.get('sub')}")
+        logger.info(f"📩 User message: {chat_message.message}")
+        logger.info(f"👤 Token subject: {claims.get('sub')}")
+
+        # Schedule session cleanup
+        background_tasks.add_task(cleanup_sessions)
 
         dynamic_schema_info = get_schema_info_from_vector(chat_message.message)
         sql_agent = get_sql_agent(dynamic_schema_info)
@@ -217,28 +315,35 @@ async def process_chat_message(
         if not sql:
             return ChatResponse(response="⚠️ Could not find a SQL query in the output.", error="No SQL query generated")
 
-        print(f"🧠 Generated SQL:\n{sql}")
-        query_result = run_query(sql, access_token)
-        print(query_result)
+        logger.info(f"🧠 Generated SQL:\n{sql}")
+        query_result = run_query(sql, user_id)
+        logger.info(query_result)
+        
         response_text = f"🔍 **Generated SQL:**\n```sql\n{sql}\n```"
-        if query_result["table_data"]:
+        if query_result.get("table_data"):
             response_text += "\n\n📊 **Query Result:**"
+        
         error = query_result.get("error", "")
         return ChatResponse(
             response=response_text,
             sql_query=sql,
-            table_data=query_result["table_data"],
+            table_data=query_result.get("table_data"),
             error=error
         )
 
-
     except Exception as e:
-        print(f"❌ Chat processing error: {e}")
+        logger.error(f"❌ Chat processing error: {e}")
         return ChatResponse(response=f"❌ Error processing your query: {str(e)}", error=str(e))
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "service": "SQLBot API"}
+    active_sessions = session_manager.get_active_sessions_count()
+    return {
+        "status": "healthy", 
+        "service": "SQLBot API",
+        "active_sessions": active_sessions,
+        "session_storage": "Redis" if session_manager.use_redis else "Memory"
+    }
 
 if __name__ == "__main__":
     import uvicorn

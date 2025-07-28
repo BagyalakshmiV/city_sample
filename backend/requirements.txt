@@ -15,3 +15,5 @@ httpx
 cryptography
 python-multipart
 python-jose[cryptography]
+redis
+itsdangerous

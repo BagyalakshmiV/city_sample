@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useMsal } from '@azure/msal-react';
+import { useSession } from '../context/SessionContext';
 import styled from 'styled-components';
 import ReactMarkdown from 'react-markdown';
-import { loginRequest } from '../config/authConfig';
 import { TailSpin } from 'react-loader-spinner';
 
 // === Styled Components ===
@@ -72,7 +71,6 @@ const UserButton = styled.button`
   }
 `;
 
-
 const DropdownPanel = styled.div`
   position: absolute;
   top: 100%;
@@ -103,6 +101,13 @@ const Avatar = styled.div`
   font-size: 24px;
 `;
 
+const SessionInfo = styled.div`
+  font-size: 12px;
+  color: #888;
+  margin-top: 10px;
+  text-align: center;
+`;
+
 const LogoutButton = styled.button`
   background-color: #ff5c5c;
   color: white;
@@ -129,7 +134,6 @@ const MessagesContainer = styled.div`
   width: 100%;
 `;
 
-
 const Message = styled.div`
   margin: 15px 0;
   padding: 15px;
@@ -154,7 +158,6 @@ const Message = styled.div`
     align-self: flex-start;
   `}
 `;
-
 
 const MarkdownTableWrapper = styled.div`
   table {
@@ -239,15 +242,25 @@ const Description = styled.div`
   font-size: 15px;
 `;
 
+const ErrorMessage = styled.div`
+  background-color: rgba(255, 92, 92, 0.1);
+  border: 1px solid #ff5c5c;
+  color: #ff5c5c;
+  padding: 15px;
+  border-radius: 8px;
+  margin: 10px auto;
+  text-align: center;
+  max-width: 1200px;
+`;
 
 // === ChatPage Component ===
 const ChatPage = () => {
-  const { instance, accounts } = useMsal();
+  const { user, logout, makeAuthenticatedRequest, sessionExpiry, isLoading } = useSession();
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [userInfo, setUserInfo] = useState(null);
+  const [isSending, setIsSending] = useState(false);
   const [dropdownVisible, setDropdownVisible] = useState(false);
+  const [connectionError, setConnectionError] = useState(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef();
 
@@ -256,43 +269,29 @@ const ChatPage = () => {
   }, [messages]);
 
   useEffect(() => {
-    fetchUserInfo();
-  }, []);
-
-  useEffect(() => {
-    if (!isLoading) {
+    if (!isSending) {
       inputRef.current?.focus();
     }
-  }, [isLoading]);
+  }, [isSending]);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (dropdownVisible && !event.target.closest('[data-user-menu]')) {
+        setDropdownVisible(false);
+      }
+    };
+
+    document.addEventListener('click', handleClickOutside);
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, [dropdownVisible]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
-  const fetchUserInfo = async () => {
-    try {
-      const response = await instance.acquireTokenSilent({
-        ...loginRequest,
-        account: accounts[0]
-      });
-
-      const apiResponse = await fetch('/api/user', {
-        headers: {
-          'Authorization': `Bearer ${response.accessToken}`
-        }
-      });
-
-      if (apiResponse.ok) {
-        const userData = await apiResponse.json();
-        setUserInfo(userData);
-      }
-    } catch (error) {
-      console.error('Error fetching user info:', error);
-    }
-  };
-
   const sendMessage = async () => {
-    if (!inputValue.trim() || isLoading) return;
+    if (!inputValue.trim() || isSending) return;
 
     const userMessage = {
       text: inputValue.trim(),
@@ -301,32 +300,25 @@ const ChatPage = () => {
     };
 
     setInputValue('');
-    setIsLoading(true);
+    setIsSending(true);
+    setConnectionError(null);
     setMessages(prev => [...prev, userMessage]);
 
     try {
-      const response = await instance.acquireTokenSilent({
-        ...loginRequest,
-        account: accounts[0]
-      });
-
-      const apiResponse = await fetch('/api/chat', {
+      const response = await makeAuthenticatedRequest('/api/chat', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${response.accessToken}`
-        },
         body: JSON.stringify({ message: userMessage.text })
       });
 
-      if (apiResponse.ok) {
-        const data = await apiResponse.json();
+      if (response.ok) {
+        const data = await response.json();
         // 🔍 Debug logs
         console.log("📨 Server Response:");
         console.log("Response text:", data.response);
         console.log("SQL Query:", data.sql_query);
         console.log("Table Data:", data.table_data);
         console.log("Error:", data.error);
+        
         setMessages(prev => [...prev, {
           text: data.response,
           table_data: data.table_data || null,
@@ -335,6 +327,8 @@ const ChatPage = () => {
           isUser: false,
           timestamp: new Date().toISOString()
         }]);
+      } else if (response.status === 401) {
+        setConnectionError('Session expired. Please refresh the page to sign in again.');
       } else {
         setMessages(prev => [...prev, {
           text: '❌ Error: Unable to process your request. Please try again.',
@@ -344,13 +338,14 @@ const ChatPage = () => {
       }
     } catch (error) {
       console.error('Error sending message:', error);
+      setConnectionError('Unable to connect to the server. Please check your internet connection.');
       setMessages(prev => [...prev, {
         text: '❌ Error: Unable to connect to the server. Please try again.',
         isUser: false,
         timestamp: new Date().toISOString()
       }]);
     } finally {
-      setIsLoading(false);
+      setIsSending(false);
     }
   };
 
@@ -360,8 +355,12 @@ const ChatPage = () => {
     }
   };
 
-  const handleLogout = () => {
-    instance.logoutPopup();
+  const handleLogout = async () => {
+    try {
+      await logout();
+    } catch (error) {
+      console.error('Logout error:', error);
+    }
   };
 
   const formatTimestamp = (iso) => {
@@ -369,39 +368,65 @@ const ChatPage = () => {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
+  const getSessionStatus = () => {
+    if (!sessionExpiry) return 'Active';
+    
+    const now = new Date();
+    const expiry = new Date(sessionExpiry);
+    const timeLeft = expiry.getTime() - now.getTime();
+    
+    if (timeLeft <= 0) return 'Expired';
+    
+    const minutes = Math.floor(timeLeft / (1000 * 60));
+    const hours = Math.floor(minutes / 60);
+    
+    if (hours > 0) return `${hours}h ${minutes % 60}m left`;
+    return `${minutes}m left`;
+  };
+
+  if (isLoading) {
+    return null; // Let the App component handle the loading spinner
+  }
+
   return (
     <ChatContainer>
       <Header>
         <Title style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-  SQLBot
-  <img
-    src="https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExMm43YWM2cGJoOW5tMnlyaXU4OWI1am9id3l4cHF0bjJ0Zjd5bW5qcSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/dzBLyjVBCtWgGPiXCJ/giphy.gif"
-    alt="Robot"
-    style={{
-      width: '32px',
-      height: '32px',
-      borderRadius: '4px',
-      objectFit: 'cover',
-      animation: 'float 3s ease-in-out infinite'
-    }}
-  />
-</Title>
+          SQLBot
+          <img
+            src="https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExMm43YWM2cGJoOW5tMnlyaXU4OWI1am9id3l4cHF0bjJ0Zjd5bW5qcSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/dzBLyjVBCtWgGPiXCJ/giphy.gif"
+            alt="Robot"
+            style={{
+              width: '32px',
+              height: '32px',
+              borderRadius: '4px',
+              objectFit: 'cover',
+              animation: 'float 3s ease-in-out infinite'
+            }}
+          />
+        </Title>
 
-        <UserMenu>
+        <UserMenu data-user-menu>
           <UserButton onClick={() => setDropdownVisible(!dropdownVisible)}>
             My Account ⚙️
           </UserButton>
           <DropdownPanel visible={dropdownVisible}>
             <UserInfo>
               <Avatar>👤</Avatar>
-              {userInfo && (
+              {user && (
                 <>
-                  <div><strong>{userInfo.name}</strong></div>
+                  <div><strong>{user.name}</strong></div>
                   <div style={{ fontSize: '14px', color: '#aaa' }}>
-                    Role: {userInfo.role}
+                    Role: {user.role}
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#888', marginTop: '5px' }}>
+                    {user.email}
                   </div>
                 </>
               )}
+              <SessionInfo>
+                Session: {getSessionStatus()}
+              </SessionInfo>
             </UserInfo>
             <LogoutButton onClick={handleLogout}>
               🔓 Sign out
@@ -414,6 +439,12 @@ const ChatPage = () => {
         Bot runs SQL Server queries based on user privileges.<br />
         <strong>Sample Prompts:</strong> Marketing: <strong>'Available Brands'</strong>, Finance: <strong>'Top Discounted Products'</strong>, Analytics: <strong>'Which products had the highest ratings?'</strong>
       </Description>
+
+      {connectionError && (
+        <ErrorMessage>
+          {connectionError}
+        </ErrorMessage>
+      )}
 
       <MessagesContainer>
         {messages.map((message, index) => (
@@ -468,10 +499,9 @@ const ChatPage = () => {
               {formatTimestamp(message.timestamp)}
             </div>
           </Message>
-
         ))}
 
-        {isLoading && (
+        {isSending && (
           <Message isUser={false}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <TailSpin height="20" width="20" color="#0A84FF" />
@@ -482,7 +512,6 @@ const ChatPage = () => {
         <div ref={messagesEndRef} />
       </MessagesContainer>
 
-
       <InputContainer>
         <MessageInput
           type="text"
@@ -491,10 +520,10 @@ const ChatPage = () => {
           onChange={(e) => setInputValue(e.target.value)}
           onKeyPress={handleKeyPress}
           placeholder="Ask me about your data..."
-          disabled={isLoading}
+          disabled={isSending}
         />
-        <SendButton onClick={sendMessage} disabled={isLoading || !inputValue.trim()}>
-          {isLoading ? '...' : 'Send'}
+        <SendButton onClick={sendMessage} disabled={isSending || !inputValue.trim()}>
+          {isSending ? '...' : 'Send'}
         </SendButton>
       </InputContainer>
     </ChatContainer>

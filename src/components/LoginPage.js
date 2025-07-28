@@ -1,6 +1,5 @@
-import React from 'react';
-import { useMsal } from '@azure/msal-react';
-import { loginRequest } from '../config/authConfig';
+import React, { useState, useEffect } from 'react';
+import { useSession } from '../context/SessionContext';
 import styled from 'styled-components';
 import { useNavigate } from 'react-router-dom';
 
@@ -23,7 +22,6 @@ const PageWrapper = styled.div`
     100% { background-position: 0% 50%; }
   }
 `;
-
 
 const SignInTopRight = styled.button`
   position: absolute;
@@ -57,6 +55,12 @@ const SignInTopRight = styled.button`
     box-shadow: 0 3px 10px rgba(44, 83, 100, 0.3);
   }
 
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+  }
+
   @keyframes pulseZoom {
     0%, 100% { transform: scale(1); }
     50% { transform: scale(1.03); }
@@ -77,8 +81,6 @@ const SignInTopRight = styled.button`
     }
   }
 `;
-
-
 
 const LogoContainer = styled.div`
   width: 260px;
@@ -113,8 +115,6 @@ const TitleGif = styled.img`
   height: 50px;
 `;
 
-
-
 const Subtitle = styled.p`
   font-size: 1.2em;
   color: #cccccc;
@@ -123,22 +123,60 @@ const Subtitle = styled.p`
   text-align: center;
 `;
 
+const ErrorMessage = styled.div`
+  background-color: rgba(255, 92, 92, 0.1);
+  border: 1px solid #ff5c5c;
+  color: #ff5c5c;
+  padding: 15px;
+  border-radius: 8px;
+  margin-top: 20px;
+  text-align: center;
+  max-width: 400px;
+`;
+
 const LoginPage = () => {
-  const { instance } = useMsal();
+  const { login, isAuthenticated, isLoading } = useSession();
   const navigate = useNavigate();
+  const [loginError, setLoginError] = useState(null);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+
+  // Redirect if already authenticated
+  useEffect(() => {
+    if (isAuthenticated && !isLoading) {
+      navigate('/chat');
+    }
+  }, [isAuthenticated, isLoading, navigate]);
 
   const handleLogin = async () => {
+    setIsLoggingIn(true);
+    setLoginError(null);
+    
     try {
-      await instance.loginPopup(loginRequest);
-      navigate('/chat');
+      await login();
+      // Navigation will be handled by the useEffect above
     } catch (error) {
       console.error('Login failed:', error);
+      setLoginError(
+        error.message || 'Login failed. Please try again.'
+      );
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
+  // Show loading state during initial authentication check
+  if (isLoading) {
+    return null; // Let the App component handle the loading spinner
+  }
+
   return (
     <PageWrapper>
-      <SignInTopRight onClick={handleLogin}>🔐 Sign in</SignInTopRight>
+      <SignInTopRight 
+        onClick={handleLogin} 
+        disabled={isLoggingIn}
+      >
+        {isLoggingIn ? '🔄 Signing in...' : '🔐 Sign in'}
+      </SignInTopRight>
 
       <LogoContainer>
         <LogoImage src="/images/city-logo.png" alt="City Holding Logo" />
@@ -157,6 +195,12 @@ const LoginPage = () => {
         <br />
         Build smarter decisions using SQLBot.
       </Subtitle>
+
+      {loginError && (
+        <ErrorMessage>
+          {loginError}
+        </ErrorMessage>
+      )}
     </PageWrapper>
   );
 };
