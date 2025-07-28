@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pandas
+crewai
+python-dotenv
+openai
+tabulate
+pyodbc
+msal
+azure-identity
+chromadb
+sqlalchemy
+authlib
+httpx
+cryptography
+python-multipart
+python-jose[cryptography]
